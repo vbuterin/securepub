@@ -383,6 +383,37 @@ class Publication(unittest.TestCase):
         self.assertNotIn('SSH_AUTH_SOCK', env)
         self.assertNotIn('MSB_PATH', env)
         self.assertFalse(Path(env['MBOX_STATE_ROOT']).is_relative_to(output))
+        self.assertLess(len(os.fsencode(env['MSB_HOME'])), 32)
+        self.assertFalse(Path(env['MSB_HOME']).parent.exists())
+
+    def test_monkeybox_runtime_short_private_and_cleaned_on_failure(self):
+        output = self.root / ('long-state-' + 'x' * 120) / 'export'
+        output.mkdir(parents=True)
+        runtimes = []
+
+        def launch(*args, **kwargs):
+            env = kwargs['env']
+            runtime = Path(env['MSB_HOME']).parent
+            runtimes.append(runtime)
+            self.assertEqual(runtime.parent, Path('/tmp'))
+            self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(runtime.stat().st_uid, os.getuid())
+            self.assertLess(len(os.fsencode(env['MSB_HOME'])), 32)
+            self.assertFalse(runtime.is_relative_to(output))
+            self.assertFalse(runtime.is_relative_to(self.src))
+            self.assertEqual(Path(env['MBOX_STATE_ROOT']).parent, runtime)
+            return mock.Mock(returncode=1)
+
+        with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
+                mock.patch.object(pub.sys, 'executable', '/nix/store/test/bin/python3'), \
+                mock.patch.object(pub, '__file__', '/nix/store/publisher/securepub.py'), \
+                mock.patch.object(pub.subprocess, 'Popen', side_effect=launch), \
+                mock.patch.dict(os.environ, TMPDIR=str(output), MSB_HOME='/untrusted/engine'):
+            for _ in range(2):
+                with self.assertRaisesRegex(pub.Failure, 'Sandboxed export failed'):
+                    pub.export_backend(self.src, output, backend='monkeybox')
+        self.assertEqual(len(set(runtimes)), 2)
+        self.assertTrue(all(not path.exists() for path in runtimes))
 
     def test_approval_cannot_come_from_stdin(self):
         with mock.patch("builtins.open", side_effect=OSError("no tty")):

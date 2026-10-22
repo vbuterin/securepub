@@ -64,8 +64,12 @@ repositories are fine: each publication is a separate bundle and approval.
 - Primary: a dedicated Monkeybox microVM with blocked network, no port relays,
   no host profile, no configured persistent binds, no desktop/audio/camera grants,
   and an ephemeral guest home. Only export output is the writable project mount.
-  Per-attempt engine state is private and outside guest grants, separate from
-  ordinary mbox engines. Kernel isolation comes from the VM, not namespaces.
+  Per-attempt engine state uses a short, random 0700 `/tmp/sp-*` directory,
+  outside guest grants and separate from ordinary mbox engines. Explicit short
+  `MSB_HOME`/`MBOX_STATE_ROOT` paths avoid the Unix socket path-length limit;
+  host `TMPDIR` is not used for these paths. Normal success/failure cleans them;
+  SIGKILL or a machine crash may leave private runtime files for manual cleanup.
+  Kernel isolation comes from the VM, not namespaces.
 - Fallback: Bubblewrap with private network/PID/IPC/user namespaces and private
   proc/dev/tmp/home. This shares the host kernel and requires explicit consent.
 - Export errors do not certify the checkout safe. Object parsing in the host

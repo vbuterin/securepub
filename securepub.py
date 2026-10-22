@@ -273,6 +273,20 @@ def export_checkout(directory, output, source=None):
 
 
 def export_backend(directory, output, source=None, *, backend):
+    """Keep VM runtime paths short, private, and outside the export grants."""
+    if backend == 'monkeybox':
+        # Unix socket paths are limited to 108 bytes. Do not inherit TMPDIR or
+        # derive MSB_HOME from potentially long checkout/user-state paths.
+        with tempfile.TemporaryDirectory(prefix='sp-', dir='/tmp') as runtime:
+            root = Path(runtime)
+            for grant in (directory, output):
+                if root.resolve().is_relative_to(grant.resolve()):
+                    raise Failure('Monkeybox runtime must be outside checkout/export grants.')
+            return _export_backend(directory, output, source, backend=backend, runtime=root)
+    return _export_backend(directory, output, source, backend=backend)
+
+
+def _export_backend(directory, output, source=None, *, backend, runtime=None):
     """Only this credential-free process may run Git against checkout config."""
     directory = directory.resolve(strict=True)
     git = str(Path(executable(GIT_EXECUTABLE)).resolve())
@@ -304,11 +318,12 @@ def export_backend(directory, output, source=None, *, backend):
             raise Failure('Monkeybox requires the installed immutable export helper.')
         # The project mount is ONLY the output directory. Checkout is a separate
         # read-only grant. Engine state is outside every guest grant.
-        home = output.parent / (output.name + '-host')
+        home = runtime / 'h'
         home.mkdir(mode=0o700)
         env = clean_environment(home)
         env['SECUREPUB_CHECKOUT'] = str(directory)
-        env['MBOX_STATE_ROOT'] = str(home / 'mbox')
+        env['MBOX_STATE_ROOT'] = str(runtime / 'm')
+        env['MSB_HOME'] = str(runtime / 'e')
         command = [launcher, str(output), '--ephemeral', '--network', 'blocked',
                    '--no-visual', '--no-audio', '--no-microphone', '--no-camera', '--',
                    python, '-I', str(helper), git, source or '', str(directory), str(output)]
