@@ -21,6 +21,7 @@ REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+\Z")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*\Z")
 OID = re.compile(r"[0-9a-f]{40}\Z")
 OUTPUT_LIMIT = 2 * 1024 * 1024
+METADATA_LIMIT = 8192
 # Nix packaging replaces these with immutable executable paths. Source-mode
 # execution trusts the host's PATH; never run a guest-modified source copy.
 GIT_EXECUTABLE = "git"
@@ -333,7 +334,11 @@ def export_backend(directory, output, source=None, *, backend):
     with os.fdopen(fd, 'rb') as file:
         if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
             raise Failure('Invalid export metadata file')
-        metadata = json.loads(file.read(8193))
+        encoded = file.read(METADATA_LIMIT + 1)
+        if len(encoded) > METADATA_LIMIT:
+            raise Failure('Export metadata exceeded the size limit.')
+        # Validate the whole bounded document, never a truncated JSON prefix.
+        metadata = json.loads(encoded)
     if not isinstance(metadata, dict) or set(metadata) != {'origin', 'branch', 'oid', 'dirty'}:
         raise Failure('Invalid export metadata')
     if not all(isinstance(metadata[k], str) for k in ('origin', 'branch', 'oid')):

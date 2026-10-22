@@ -238,6 +238,23 @@ class Publication(unittest.TestCase):
         self.assertIn('Destination: owner/repo refs/heads/main', messages)
         self.assertIn('NOT included', messages)
 
+    def test_export_rejects_oversized_metadata(self):
+        output = self.root / 'oversized-output'
+        output.mkdir()
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        encoded = json.dumps(metadata).encode('ascii')
+        child = mock.Mock(returncode=0)
+        with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
+                mock.patch.object(pub.sys, 'executable', '/nix/store/test/bin/python3'), \
+                mock.patch.object(pub.subprocess, 'Popen', return_value=child):
+            # A complete, valid document at the limit remains accepted.
+            (output / 'metadata.json').write_bytes(encoded.ljust(8192, b' '))
+            self.assertEqual(pub.export_backend(self.src, output, backend='bubblewrap'), metadata)
+            for suffix in (b' ', b' ' * 32 + b'ignored trailing garbage'):
+                (output / 'metadata.json').write_bytes(encoded.ljust(8192, b' ') + suffix)
+                with self.assertRaisesRegex(pub.Failure, 'metadata.*limit'):
+                    pub.export_backend(self.src, output, backend='bubblewrap')
+
     def test_export_command_contains_only_expected_grants(self):
         output = self.root / 'output'
         output.mkdir()
