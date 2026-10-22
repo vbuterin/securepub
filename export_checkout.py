@@ -3,11 +3,26 @@
 import json
 import os
 from pathlib import Path
+import resource
 import subprocess
 import sys
 
 
+def export_limits():
+    # Apply parser/export caps inside the guest, not to the VM disk creator.
+    for kind, cap in ((resource.RLIMIT_CORE, 0),
+                      (resource.RLIMIT_CPU, 180),
+                      (resource.RLIMIT_AS, 4 * 1024**3),
+                      (resource.RLIMIT_FSIZE, 2 * 1024**3),
+                      (resource.RLIMIT_NOFILE, 128)):
+        soft, hard = resource.getrlimit(kind)
+        values = [cap] + [n for n in (soft, hard) if n != resource.RLIM_INFINITY]
+        bound = min(values)
+        resource.setrlimit(kind, (bound, bound))
+
+
 def main():
+    export_limits()
     git = sys.argv[1]
     requested = sys.argv[2]
     repo = Path(sys.argv[3]) if len(sys.argv) > 3 else Path('/repo')

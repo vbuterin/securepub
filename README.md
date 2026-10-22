@@ -81,6 +81,12 @@ repositories are fine: each publication is a separate bundle and approval.
 - Imports SHA-1, self-contained bundles only. Object validation and process
   limits are defenses in depth, not a parser sandbox or complete disk quota.
   Bundle default limit is 512 MiB, max 2048 MiB. Full histories can be costly.
+  Git/export resource caps apply inside the guest and to host-side Git, not to
+  the Monkeybox supervisor: its default sparse VM disk exceeds the 2 GiB export
+  cap. The supervisor retains inherited host limits, disables core dumps, and
+  has the export wall-clock timeout; the dedicated VM bounds guest memory/CPUs.
+  Supervisor logs/runtime disk usage have no additional per-file cap from
+  securepub. These limits are not a complete disk quota.
 - New branches and fast-forward updates only. No deletion, tags, forced history
   rewrite, or fallback to an implicit `main` destination. A compare-and-swap lease checks the
   reviewed prior remote revision (or absence). Git may treat a concurrent update

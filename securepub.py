@@ -43,9 +43,17 @@ def branch(value):
     return value
 
 
-def limits():
+def vm_limits():
+    # libkrun needs sparse disk files and a VM-sized virtual address space.
+    # Do not impose Git-parser FSIZE/AS/NOFILE caps on the VM supervisor.
+    # Keep inherited host limits; the launcher still has a wall-clock timeout
+    # and the dedicated mbox configuration bounds guest memory/vCPUs.
     os.setsid()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def limits():
+    vm_limits()
     resource.setrlimit(resource.RLIMIT_CPU, (180, 180))
     resource.setrlimit(resource.RLIMIT_AS, (4 * 1024**3, 4 * 1024**3))
     resource.setrlimit(resource.RLIMIT_FSIZE, (2 * 1024**3, 2 * 1024**3))
@@ -333,7 +341,8 @@ def _export_backend(directory, output, source=None, *, backend, runtime=None):
         raise Failure('Unknown export backend')
     with tempfile.TemporaryFile() as log:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
-                                 stderr=log, env=env, preexec_fn=limits)
+                                 stderr=log, env=env,
+                                 preexec_fn=vm_limits if backend == 'monkeybox' else limits)
         try:
             child.wait(timeout=180)
         except BaseException:

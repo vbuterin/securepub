@@ -268,6 +268,7 @@ class Publication(unittest.TestCase):
         command = popen.call_args.args[0]
         for flag in ('--unshare-all', '--new-session', '--clearenv', '--die-with-parent'):
             self.assertIn(flag, command)
+        self.assertIs(popen.call_args.kwargs['preexec_fn'], pub.limits)
         self.assertIn(['--ro-bind', str(self.src), '/repo'], [command[i:i+3] for i in range(len(command))])
         self.assertEqual(command.count('--bind'), 1)
         self.assertNotIn('SSH_AUTH_SOCK', popen.call_args.kwargs['env'])
@@ -363,6 +364,32 @@ class Publication(unittest.TestCase):
                     pub.confirm_fallback()
             self.assertIn('shares the host kernel', tty.write.call_args.args[0])
 
+    def test_vm_limits_allow_sparse_disk_but_git_limits_do_not(self):
+        # Private sparse fixture: ftruncate changes logical size without writing
+        # 8 GiB. Never launch a VM or touch any existing runtime disk.
+        script = ('import os, resource; '
+                  'assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0); '
+                  'f = open("disk", "wb"); os.ftruncate(f.fileno(), 8 * 1024**3)')
+        for setup, success in ((pub.limits, False), (pub.vm_limits, True)):
+            result = subprocess.run([os.sys.executable, '-c', script], cwd=self.root,
+                                    preexec_fn=setup, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode == 0, success, result.stderr)
+            (self.root / 'disk').unlink(missing_ok=True)
+
+    def test_guest_export_limits_preserve_tighter_inherited_caps(self):
+        spec = importlib.util.spec_from_file_location('export_helper',
+                Path(pub.__file__).with_name('export_checkout.py'))
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        for inherited in ((helper.resource.RLIM_INFINITY,) * 2, (64, 96)):
+            with mock.patch.object(helper.resource, 'getrlimit', return_value=inherited), \
+                    mock.patch.object(helper.resource, 'setrlimit') as setter:
+                helper.export_limits()
+            limits = dict((c.args[0], c.args[1]) for c in setter.call_args_list)
+            expected = 2 * 1024**3 if inherited[0] == helper.resource.RLIM_INFINITY else 64
+            self.assertEqual(limits[helper.resource.RLIMIT_FSIZE], (expected, expected))
+            self.assertEqual(limits[helper.resource.RLIMIT_CORE], (0, 0))
+
     def test_monkeybox_command_uses_dedicated_launcher(self):
         output = self.root / 'vm-output'
         output.mkdir()
@@ -376,6 +403,7 @@ class Publication(unittest.TestCase):
             self.assertEqual(pub.export_backend(self.src, output, backend='monkeybox'), metadata)
         command = popen.call_args.args[0]
         env = popen.call_args.kwargs['env']
+        self.assertIs(popen.call_args.kwargs['preexec_fn'], pub.vm_limits)
         self.assertIn(pub.MONKEYBOX_EXECUTABLE, command[0])
         self.assertEqual(command[1], str(output))
         self.assertIn('--ephemeral', command)
