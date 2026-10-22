@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "monkeybox": {
+      "inputs": { "nixpkgs": [ "nixpkgs" ] },
+      "locked": {
+        "lastModified": 1792631132,
+        "narHash": "sha256-cyk23JF9vdsbs7auHGuY0lLD/Bk3kapr0it3Xx17vtk=",
+        "owner": "vbuterin",
+        "repo": "monkeybox",
+        "rev": "5c6e50a406e32a8ea6e7ea380960d24b88fdfaf4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "vbuterin",
+        "repo": "monkeybox",
+        "rev": "5c6e50a406e32a8ea6e7ea380960d24b88fdfaf4",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1790463110,
@@ -17,7 +34,7 @@
       }
     },
     "root": {
-      "inputs": { "nixpkgs": "nixpkgs" }
+      "inputs": { "monkeybox": "monkeybox", "nixpkgs": "nixpkgs" }
     }
   },
   "root": "root",

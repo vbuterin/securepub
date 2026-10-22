@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Disposable local Git tests: no account, SSH, credentials, or network."""
 import importlib.util
+import json
+import shutil
 import os
 import pty
 import select
@@ -207,6 +209,163 @@ class Publication(unittest.TestCase):
                     os.kill(pid, 9)
                     os.waitpid(pid, 0)
                 os.close(fd)
+
+    def test_origin_validation(self):
+        for url in ('git@github.com:owner/repo.git', 'ssh://git@github.com/owner/repo.git',
+                    'https://github.com/owner/repo', 'https://github.com/owner/repo.git'):
+            self.assertEqual(pub.github_origin(url), 'owner/repo')
+        for url in ('ext::evil', 'file:///repo', 'git@evil.com:owner/repo',
+                    'https://github.com/owner/repo?x=y', 'https://github.com/owner/../repo',
+                    'https://token@github.com/owner/repo', 'https://github.com/owner/repo\n'):
+            with self.assertRaises(pub.Failure):
+                pub.github_origin(url)
+
+    def test_directory_cli_defaults_with_fake_export(self):
+        _, oid, bundle = self.stage()
+        home = self.root / 'private-home'
+        home.mkdir()
+
+        def export(directory, output, source):
+            self.assertEqual(directory, self.src)
+            self.assertIsNone(source)
+            shutil.copyfile(bundle, output / 'checkout.bundle')
+            return dict(origin='https://github.com/owner/repo.git', branch='main', oid=oid, dirty=True)
+
+        with mock.patch.dict(os.environ, HOME=str(home)), mock.patch.object(pub, 'export_checkout', export), \
+                mock.patch('builtins.print') as printer:
+            self.assertEqual(pub.main([str(self.src), '--inspect']), 0)
+        messages = '\n'.join(str(c.args[0]) for c in printer.call_args_list)
+        self.assertIn('Destination: owner/repo refs/heads/main', messages)
+        self.assertIn('NOT included', messages)
+
+    def test_export_command_contains_only_expected_grants(self):
+        output = self.root / 'output'
+        output.mkdir()
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        (output / 'metadata.json').write_text(json.dumps(metadata))
+        child = mock.Mock(returncode=0)
+        with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
+                mock.patch.object(pub.sys, 'executable', '/nix/store/test/bin/python3'), \
+                mock.patch.object(pub.subprocess, 'Popen', return_value=child) as popen:
+            self.assertEqual(pub.export_backend(self.src, output, backend='bubblewrap'), metadata)
+        command = popen.call_args.args[0]
+        for flag in ('--unshare-all', '--new-session', '--clearenv', '--die-with-parent'):
+            self.assertIn(flag, command)
+        self.assertIn(['--ro-bind', str(self.src), '/repo'], [command[i:i+3] for i in range(len(command))])
+        self.assertEqual(command.count('--bind'), 1)
+        self.assertNotIn('SSH_AUTH_SOCK', popen.call_args.kwargs['env'])
+
+    @unittest.skipUnless(os.environ.get('SECUREPUB_TEST_BWRAP') == '1',
+                         'opt-in host Bubblewrap integration test')
+    def test_real_directory_export(self):
+        run(self.src, 'remote', 'add', 'origin', 'https://github.com/owner/repo.git')
+        run(self.src, 'config', 'core.fsmonitor', '/repo/evil')
+        (self.src / 'evil').write_text('#!/bin/sh\ntouch /out/hook-ran\n')
+        (self.src / 'evil').chmod(0o755)
+        hooks = self.src / '.git/hooks'
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / 'pre-auto-gc'
+        hook.write_text('#!/bin/sh\ntouch /out/hook-ran\n')
+        hook.chmod(0o755)
+        output = self.root / 'output'
+        output.mkdir()
+        metadata = pub.export_backend(self.src, output, backend='bubblewrap')
+        self.assertEqual(metadata['origin'], 'https://github.com/owner/repo.git')
+        self.assertEqual(metadata['branch'], 'main')
+        self.assertTrue(metadata['dirty'])
+        self.assertFalse((output / 'hook-ran').exists())
+        staged = self.root / 'verified'
+        staged.mkdir()
+        oid, _ = pub.prepare(LocalGit(staged, GIT), output / 'checkout.bundle', 'main', 1024**2)
+        self.assertEqual(oid, metadata['oid'])
+        run(self.src, 'checkout', '--detach')
+        with self.assertRaises(pub.Failure):
+            pub.export_backend(self.src, output, backend='bubblewrap')
+
+    @unittest.skipUnless(os.environ.get('SECUREPUB_TEST_MONKEYBOX') == '1',
+                         'opt-in installed Monkeybox exporter test')
+    def test_real_monkeybox_export(self):
+        # Run using the installed module, whose launcher/helper paths are pinned.
+        installed = os.environ.get('SECUREPUB_INSTALLED_MODULE')
+        self.assertTrue(installed, 'Set SECUREPUB_INSTALLED_MODULE to the installed securepub.py')
+        spec = importlib.util.spec_from_file_location('installed_securepub', installed)
+        installed_pub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installed_pub)
+        run(self.src, 'remote', 'add', 'origin', 'git@github.com:owner/repo.git')
+        output = self.root / 'vm-real-output'
+        output.mkdir()
+        metadata = installed_pub.export_backend(self.src, output, backend='monkeybox')
+        self.assertEqual(metadata['branch'], 'main')
+        self.assertEqual(metadata['origin'], 'git@github.com:owner/repo.git')
+        staged = self.root / 'vm-verified'
+        staged.mkdir()
+        oid, _ = pub.prepare(LocalGit(staged, GIT), output / 'checkout.bundle', 'main', 1024**2)
+        self.assertEqual(oid, metadata['oid'])
+
+    def test_backend_selection_and_confirmed_fallback(self):
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        for mode in ('primary', 'fallback', 'deny'):
+            output = self.root / mode
+            output.mkdir()
+            calls = []
+            def backend(directory, dest, source, *, backend):
+                calls.append(backend)
+                if backend == 'monkeybox' and mode != 'primary':
+                    (dest / 'checkout.bundle').write_bytes(b'failed-export')
+                    raise pub.Failure('VM unavailable')
+                self.assertFalse((dest / 'checkout.bundle').exists())
+                (dest / 'checkout.bundle').write_bytes(b'good-export')
+                return metadata
+            with mock.patch.object(pub, 'export_backend', side_effect=backend), \
+                    mock.patch.object(pub, 'confirm_fallback') as approval:
+                if mode == 'deny':
+                    approval.side_effect = pub.Failure('cancelled')
+                    with self.assertRaises(pub.Failure):
+                        pub.export_checkout(self.src, output)
+                    self.assertEqual(calls, ['monkeybox'])
+                    self.assertFalse((output / 'checkout.bundle').exists())
+                else:
+                    self.assertEqual(pub.export_checkout(self.src, output), metadata)
+                    self.assertEqual((output / 'checkout.bundle').read_bytes(), b'good-export')
+                    self.assertEqual(calls, ['monkeybox'] if mode == 'primary' else ['monkeybox', 'bubblewrap'])
+                self.assertEqual(approval.call_count, 0 if mode == 'primary' else 1)
+
+    def test_fallback_requires_terminal_and_exact_phrase(self):
+        with mock.patch('builtins.open', side_effect=OSError('no tty')):
+            with self.assertRaisesRegex(pub.Failure, 'host terminal'):
+                pub.confirm_fallback()
+        for phrase in ('yes\n', 'use bubblewrap\n'):
+            tty = mock.MagicMock()
+            tty.__enter__.return_value = tty
+            tty.readline.return_value = phrase
+            with mock.patch('builtins.open', return_value=tty):
+                if phrase == 'yes\n':
+                    with self.assertRaisesRegex(pub.Failure, 'cancelled'):
+                        pub.confirm_fallback()
+                else:
+                    pub.confirm_fallback()
+            self.assertIn('shares the host kernel', tty.write.call_args.args[0])
+
+    def test_monkeybox_command_uses_dedicated_launcher(self):
+        output = self.root / 'vm-output'
+        output.mkdir()
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        (output / 'metadata.json').write_text(json.dumps(metadata))
+        child = mock.Mock(returncode=0)
+        with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
+                mock.patch.object(pub.sys, 'executable', '/nix/store/test/bin/python3'), \
+                mock.patch.object(pub, '__file__', '/nix/store/publisher/securepub.py'), \
+                mock.patch.object(pub.subprocess, 'Popen', return_value=child) as popen:
+            self.assertEqual(pub.export_backend(self.src, output, backend='monkeybox'), metadata)
+        command = popen.call_args.args[0]
+        env = popen.call_args.kwargs['env']
+        self.assertIn(pub.MONKEYBOX_EXECUTABLE, command[0])
+        self.assertEqual(command[1], str(output))
+        self.assertIn('--ephemeral', command)
+        self.assertEqual(env['SECUREPUB_CHECKOUT'], str(self.src))
+        self.assertNotIn('SSH_AUTH_SOCK', env)
+        self.assertNotIn('MSB_PATH', env)
+        self.assertFalse(Path(env['MBOX_STATE_ROOT']).is_relative_to(output))
 
     def test_approval_cannot_come_from_stdin(self):
         with mock.patch("builtins.open", side_effect=OSError("no tty")):

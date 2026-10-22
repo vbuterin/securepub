@@ -1,9 +1,41 @@
 # securepub (beta)
 
 A **host-only publication gate**, not a Git workspace manager. Agents clone,
-commit, merge and test inside mbox/sbox. They export a Git bundle. A user runs
-securepub on the host, approves an exact commit/repository/branch, and securepub
-publishes it using existing host SSH authentication.
+commit, merge and test inside mbox/sbox. On the host, simply run:
+
+```sh
+securepub /path/to/repository
+```
+
+It reads `origin` and the current branch inside a credential-free **Monkeybox
+microVM**, exports the committed history automatically, then asks for approval of
+the exact commit/repository/branch before pushing using host SSH authentication.
+
+- Destination is the literal `remote.origin.url` on GitHub and the **same branch
+  name as the current local branch**. Upstream mappings, `push.default`,
+  `pushRemote`, URL rewrites and custom push refspecs are deliberately ignored.
+- Accepts standard GitHub SSH and HTTPS origin URLs; publication still uses SSH.
+  Explicit `origin.pushurl` is rejected to avoid ambiguity.
+- Only commits are published. Dirty/untracked files produce a warning; the tool
+  never stages files or creates commits.
+- Detached HEAD, unborn branches, linked worktrees and bare repos are rejected.
+  Linked worktrees can use explicit bundle mode instead.
+- `--repo`, `--branch`, `--source` override defaults. `--inspect` validates
+  locally without authentication or network access.
+- Approval still requires the exact confirmation phrase, not automatic consent.
+
+Directory mode tries a dedicated Monkeybox launcher first (KVM required), pinned
+by the Nix package. It does not use the host's general-purpose `mbox` profile.
+If VM launch/export fails, the host terminal asks whether to retry with
+Bubblewrap, explicitly warning that this shares the host kernel. Type
+`use bubblewrap` to authorize that one retry; anything else or no terminal cancels.
+This prompt can also appear for a bad repository/export, not just missing KVM;
+read the error rather than assuming a downgrade will fix it.
+
+Fallback permission authorizes **export only**. Publication still needs its own
+exact-commit approval. Failed output is discarded before a fresh fallback export.
+No silent downgrade, remembered permission, or unsandboxed fallback exists.
+Explicit bundle mode remains available below.
 
 No merge automation, account setup, repository creation, credential delegation,
 agent-callable daemon, `--yes`, or arbitrary destination URL. Multiple source
@@ -12,7 +44,7 @@ repositories are fine: each publication is a separate bundle and approval.
 ## Boundary
 
 - Treat the development checkout **and its `.git`** as untrusted. Do not run
-  host Git, build tools, or executable editor integrations against it.
+  unsandboxed host Git, build tools, or executable editor integrations against it.
 - Keep the installed publisher, its host state, SSH credentials, SSH agent
   socket and host terminal **outside all guest writable/control grants**.
 - Host user, installed Python/Git/OpenSSH and host ancestor directories are
@@ -21,10 +53,24 @@ repositories are fine: each publication is a separate bundle and approval.
 - mbox and sbox can export the same artifact. sbox shares the host kernel;
   GPU drivers add attack surface. These are not equivalent containment levels.
 - The publisher copies the input to private staging, never hard-links it, never
-  checks out guest files, and never runs Git in the source checkout. Input
+  checks out guest files. Only the isolated exporter runs Git in the source
+  checkout; the credential-bearing publisher uses a fresh bare repository. Input
   symlinks and non-regular files are refused. Hard-linked input is safe to copy;
   the staged inode is independent. All staged bytes are still untrusted data.
-- Fresh bare Git repository, empty template, hooks disabled on **every** Git
+- Both exporters receive the read-only checkout/Nix store/trusted helper and
+  one disposable writable export directory, without host credentials or terminal.
+  The checkout and Nix store must contain no host secrets. Metadata and bundle
+  are revalidated outside the exporter; checkout config cannot configure pushing.
+- Primary: a dedicated Monkeybox microVM with blocked network, no port relays,
+  no host profile, no configured persistent binds, no desktop/audio/camera grants,
+  and an ephemeral guest home. Only export output is the writable project mount.
+  Per-attempt engine state is private and outside guest grants, separate from
+  ordinary mbox engines. Kernel isolation comes from the VM, not namespaces.
+- Fallback: Bubblewrap with private network/PID/IPC/user namespaces and private
+  proc/dev/tmp/home. This shares the host kernel and requires explicit consent.
+- Export errors do not certify the checkout safe. Object parsing in the host
+  publishing repository is still outside either exporter sandbox.
+- Publishing uses a fresh bare Git repository, empty template, hooks disabled on **every** Git
   invocation, sanitized environment, system/global Git config disabled, no
   inherited remotes/configuration/credential helpers. Executable paths are
   pinned by the Nix package. Source-mode execution trusts host PATH.
@@ -32,7 +78,7 @@ repositories are fine: each publication is a separate bundle and approval.
   limits are defenses in depth, not a parser sandbox or complete disk quota.
   Bundle default limit is 512 MiB, max 2048 MiB. Full histories can be costly.
 - New branches and fast-forward updates only. No deletion, tags, forced history
-  rewrite, or implicit default branch. A compare-and-swap lease checks the
+  rewrite, or fallback to an implicit `main` destination. A compare-and-swap lease checks the
   reviewed prior remote revision (or absence). Git may treat a concurrent update
   to the *same desired commit* as already up to date; no new write is needed.
 - `/dev/tty` approval is a host-user interaction, **not remote attestation or a
@@ -42,7 +88,7 @@ repositories are fine: each publication is a separate bundle and approval.
   reachable history. Use a beta repository with Actions disabled or a reviewed,
   restricted CI policy. Repository contents are not certified safe by fsck.
 
-## Export inside the development sandbox
+## Alternative: explicit bundle export inside the development sandbox
 
 First commit the changes you intend to publish. Choose a source branch:
 
@@ -104,7 +150,7 @@ recovery daemon is included.
 The standalone flake exports a package, app and optional NixOS module
 (`programs.securepub.enable`). It uses an exact nixpkgs revision. Building the
 package runs disposable local tests. The module installs only the command: it
-provisions no credential, network listener, agent socket or host grants.
+provisions no credential, network listener, agent socket or persistent host grants.
 
 1. Review this initial source and publish `vbuterin/securepub` manually using
    your existing trusted workflow. This bootstrap is intentionally outside the
@@ -131,8 +177,21 @@ CLI, plus acceptance/cancellation through a private PTY. They do **not** prove
 a real SSH/GitHub push, host terminal isolation,
 mbox/sbox containment, or Nix package evaluation.
 
-Current evidence: 11 tests passed with Python and Git 2.55.0 in the development
-environment. The standalone flake has not yet been evaluated/built. Its nixpkgs
+Directory-mode orchestration, URL validation, primary/fallback ordering, denial,
+separate output directories and both sandbox commands have local tests. Run the optional real exporter test on a host with working
+user namespaces and Nix-store Python/Git:
+
+```sh
+SECUREPUB_TEST_BWRAP=1 PYTHONDONTWRITEBYTECODE=1 python3 tests/test_securepub.py -v
+```
+
+The development environment rejects Bubblewrap startup (`Unexpected capabilities
+but not setuid`). Neither the new dedicated Monkeybox package nor the fallback
+has passed real sandbox integration here. Mocked tests do not establish runtime
+containment. The Monkeybox lock entry uses the already recorded parent-config
+revision/hash; it still needs a host Nix build and a real VM export test.
+
+The original bundle-mode tests passed with Python and Git 2.55.0. The standalone flake has not yet been evaluated/built. Its nixpkgs
 lock metadata was copied from the existing Monkeybox lock for that exact revision;
 no Nix command was run to generate or validate it here.
 

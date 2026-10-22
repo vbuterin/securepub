@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-side, exact-commit GitHub publication. No development Git operations."""
+"""Host-approved GitHub publication from a checkout directory or Git bundle."""
 from __future__ import annotations
 
 import argparse
@@ -25,6 +25,9 @@ OUTPUT_LIMIT = 2 * 1024 * 1024
 # execution trusts the host's PATH; never run a guest-modified source copy.
 GIT_EXECUTABLE = "git"
 SSH_EXECUTABLE = "ssh"
+BWRAP_EXECUTABLE = "bwrap"
+# No general-purpose mbox from PATH: only the dedicated packaged launcher.
+MONKEYBOX_EXECUTABLE = "@securepub-monkeybox@"
 
 
 class Failure(Exception):
@@ -224,20 +227,136 @@ def executable(name):
     return os.path.abspath(path)
 
 
+def github_origin(value):
+    """Normalize only literal GitHub URLs; never evaluate Git URL rewrites."""
+    prefixes = ('git@github.com:', 'ssh://git@github.com/', 'https://github.com/')
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            repo = value[len(prefix):]
+            if repo.endswith('.git'):
+                repo = repo[:-4]
+            if REPO.fullmatch(repo) and repo.split('/')[1] not in ('.', '..'):
+                return repo
+    raise Failure('Unsupported origin: use a literal github.com SSH or HTTPS repository URL.')
+
+
+def confirm_fallback():
+    """Downgrading containment is separate from authorizing publication."""
+    try:
+        with open('/dev/tty', 'r', encoding='utf-8') as reader, open(
+                '/dev/tty', 'w', encoding='utf-8', buffering=1) as tty:
+            tty.write('\nMonkeybox export failed. Retry with Bubblewrap?\n'
+                      'WARNING: Bubblewrap shares the host kernel; it is not a microVM.\n'
+                      'This authorizes export only, NOT publication.\n'
+                      'Type use bubblewrap to continue; anything else cancels:\n> ')
+            if reader.readline(1024).rstrip('\n') != 'use bubblewrap':
+                raise Failure('Bubblewrap fallback cancelled.')
+    except OSError as error:
+        raise Failure('A host terminal is required to approve Bubblewrap fallback.') from error
+
+
+def export_checkout(directory, output, source=None):
+    # Never reuse a failed export's files for a different containment backend.
+    try:
+        with tempfile.TemporaryDirectory(prefix='monkeybox-', dir=output) as attempt:
+            metadata = export_backend(directory, Path(attempt), source, backend='monkeybox')
+            copy_bundle(Path(attempt) / 'checkout.bundle', output / 'checkout.bundle', 2 * 1024**3)
+            return metadata
+    except (Failure, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print('Monkeybox export failed: ' + json.dumps(str(error)), file=sys.stderr)
+    confirm_fallback()
+    with tempfile.TemporaryDirectory(prefix='bubblewrap-', dir=output) as attempt:
+        metadata = export_backend(directory, Path(attempt), source, backend='bubblewrap')
+        copy_bundle(Path(attempt) / 'checkout.bundle', output / 'checkout.bundle', 2 * 1024**3)
+        return metadata
+
+
+def export_backend(directory, output, source=None, *, backend):
+    """Only this credential-free process may run Git against checkout config."""
+    directory = directory.resolve(strict=True)
+    git = str(Path(executable(GIT_EXECUTABLE)).resolve())
+    python = str(Path(sys.executable).resolve())
+    helper = Path(__file__).with_name('export_checkout.py').resolve()
+    # The packaged runtime is entirely in the immutable Nix store. Do not mount
+    # /usr, /run, /home or the host root as a source-mode convenience fallback.
+    if not all(p.startswith('/nix/store/') for p in (git, python)):
+        raise Failure('Directory mode requires Nix-store Python and Git; use the Nix package or bundle mode.')
+    command = [BWRAP_EXECUTABLE, '--unshare-all', '--die-with-parent', '--new-session',
+               '--cap-drop', 'ALL', '--clearenv',
+               '--ro-bind', '/nix/store', '/nix/store',
+               '--ro-bind', str(directory), '/repo',
+               '--bind', str(output), '/out',
+               '--ro-bind', str(helper), '/export.py',
+               '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+               '--dir', '/home', '--chdir', '/repo']
+    for key, value in clean_environment('/home').items():
+        command += ['--setenv', key, value]
+    command += [python, '-I', '/export.py', git, source or '']
+    env = clean_environment('/nonexistent')
+    if backend == 'monkeybox':
+        # mbox's configured same-path RO binding expands this one trusted
+        # environment value. Reject mount-syntax delimiters, not spaces.
+        if any(c in str(directory) for c in (':', '\n', '\r')):
+            raise Failure('Monkeybox cannot share a path containing a colon or newline.')
+        launcher = executable(MONKEYBOX_EXECUTABLE)
+        if not str(helper).startswith('/nix/store/'):
+            raise Failure('Monkeybox requires the installed immutable export helper.')
+        # The project mount is ONLY the output directory. Checkout is a separate
+        # read-only grant. Engine state is outside every guest grant.
+        home = output.parent / (output.name + '-host')
+        home.mkdir(mode=0o700)
+        env = clean_environment(home)
+        env['SECUREPUB_CHECKOUT'] = str(directory)
+        env['MBOX_STATE_ROOT'] = str(home / 'mbox')
+        command = [launcher, str(output), '--ephemeral', '--network', 'blocked',
+                   '--no-visual', '--no-audio', '--no-microphone', '--no-camera', '--',
+                   python, '-I', str(helper), git, source or '', str(directory), str(output)]
+    elif backend == 'bubblewrap':
+        command[0] = executable(BWRAP_EXECUTABLE)
+    else:
+        raise Failure('Unknown export backend')
+    with tempfile.TemporaryFile() as log:
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=log, env=env, preexec_fn=limits)
+        try:
+            child.wait(timeout=180)
+        except BaseException:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            raise
+        if child.returncode:
+            log.seek(0)
+            raise Failure('Sandboxed export failed (no unsandboxed fallback): ' +
+                          json.dumps(log.read(4096).decode('utf-8', 'replace')))
+    fd = os.open(output / 'metadata.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise Failure('Invalid export metadata file')
+        metadata = json.loads(file.read(8193))
+    if not isinstance(metadata, dict) or set(metadata) != {'origin', 'branch', 'oid', 'dirty'}:
+        raise Failure('Invalid export metadata')
+    if not all(isinstance(metadata[k], str) for k in ('origin', 'branch', 'oid')):
+        raise Failure('Invalid export metadata types')
+    github_origin(metadata['origin'])
+    branch(metadata['branch'])
+    if not OID.fullmatch(metadata['oid']) or type(metadata['dirty']) is not bool:
+        raise Failure('Invalid export commit or dirty status')
+    return metadata
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path, help="self-contained Git bundle exported inside the sandbox")
-    parser.add_argument("--source", default="main", help="branch inside the bundle (default: main)")
-    parser.add_argument("--repo", required=True, help="explicit GitHub owner/repository")
-    parser.add_argument("--branch", required=True, help="destination branch; no implicit main")
+    parser.add_argument("path", type=Path, help="checkout directory, or self-contained Git bundle")
+    parser.add_argument("--source", help="source branch (directory: current branch; bundle: main)")
+    parser.add_argument("--repo", help="GitHub owner/repository (directory: origin)")
+    parser.add_argument("--branch", help="destination branch (directory: source branch)")
     parser.add_argument("--inspect", action="store_true", help="validate and display proposal locally; no authentication/network/push")
     parser.add_argument("--identity", type=Path, help="optional host SSH identity path (no SSH config is read)")
     parser.add_argument("--max-bundle-mib", type=int, default=512)
     args = parser.parse_args(argv)
-    if not REPO.fullmatch(args.repo) or args.repo.split("/")[1] in (".", ".."):
-        raise Failure("Destination must be a conventional GitHub owner/repository.")
-    branch(args.source)
-    ref = "refs/heads/" + branch(args.branch)
+    if args.source:
+        branch(args.source)
     if not 1 <= args.max_bundle_mib <= 2048:
         raise Failure("Bundle limit must be between 1 and 2048 MiB.")
     os.umask(0o077)
@@ -250,7 +369,28 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(prefix="publish-", dir=state) as temporary:
         git = Git(temporary, executable(GIT_EXECUTABLE), None if args.inspect else executable(SSH_EXECUTABLE),
                   str(args.identity.absolute()) if args.identity else None)
-        oid, digest = prepare(git, args.bundle.absolute(), args.source, args.max_bundle_mib * 1024**2)
+        metadata = None
+        # Export output is separate from the bare publisher repository. No host
+        # staging/configuration/credentials are writable by the export process.
+        with tempfile.TemporaryDirectory(prefix='export-', dir=state) as export_dir:
+            bundle = args.path.absolute()
+            if args.path.is_dir():
+                metadata = export_checkout(args.path, Path(export_dir), args.source)
+                args.repo = args.repo or github_origin(metadata['origin'])
+                args.source = metadata['branch']
+                args.branch = args.branch or args.source
+                bundle = Path(export_dir) / 'checkout.bundle'
+            if not args.repo or not args.branch:
+                raise Failure('Bundle mode requires --repo and --branch.')
+            if not REPO.fullmatch(args.repo) or args.repo.split('/')[1] in ('.', '..'):
+                raise Failure('Destination must be a conventional GitHub owner/repository.')
+            ref = 'refs/heads/' + branch(args.branch)
+            oid, digest = prepare(git, bundle, args.source or 'main', args.max_bundle_mib * 1024**2)
+        if metadata and oid != metadata['oid']:
+            raise Failure('Exported branch moved during preparation; retry.')
+        print('Destination: ' + args.repo + ' ' + ref)
+        if metadata and metadata['dirty']:
+            print('WARNING: uncommitted/untracked changes are NOT included. Publishing commits only.')
         print("Staged bundle SHA256: " + digest)
         print("Proposed commit: " + oid)
         # No checkout, external diff, textconv, filenames or commit messages rendered.
