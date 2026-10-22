@@ -189,14 +189,12 @@ def remote_tip(git, url, ref):
     return fields[0]
 
 
-UNSPECIFIED = object()
-
-
-def check_update(git, url, ref, oid, expected=UNSPECIFIED):
+def check_update(git, url, ref, oid):
+    # Use the live destination, not potentially stale local tracking refs. A
+    # remote ancestor is already published work; review/push only what remains.
     old = remote_tip(git, url, ref)
-    if expected is not UNSPECIFIED and old != expected:
-        raise Failure('Remote branch changed since the checkout last fetched it. '
-                      'Fetch and merge inside the development sandbox, then retry; nothing published.')
+    if old == oid:
+        return old
     if old:
         git.run("fetch", "--no-tags", "--no-recurse-submodules", "--no-auto-maintenance",
                 "--no-write-fetch-head", url, ref + ":refs/heads/remote-base", network=True)
@@ -408,7 +406,7 @@ def _export_backend(directory, output, source=None, *, backend, runtime=None):
             raise Failure('Export metadata exceeded the size limit.')
         # Validate the whole bounded document, never a truncated JSON prefix.
         metadata = json.loads(encoded)
-    if not isinstance(metadata, dict) or set(metadata) != {'origin', 'branch', 'oid', 'dirty', 'origin_tips'}:
+    if not isinstance(metadata, dict) or set(metadata) != {'origin', 'branch', 'oid', 'dirty'}:
         raise Failure('Invalid export metadata')
     if not all(isinstance(metadata[k], str) for k in ('origin', 'branch', 'oid')):
         raise Failure('Invalid export metadata types')
@@ -416,13 +414,6 @@ def _export_backend(directory, output, source=None, *, backend, runtime=None):
     branch(metadata['branch'])
     if not OID.fullmatch(metadata['oid']) or type(metadata['dirty']) is not bool:
         raise Failure('Invalid export commit or dirty status')
-    tips = metadata['origin_tips']
-    if not isinstance(tips, dict):
-        raise Failure('Invalid origin tracking refs.')
-    for name, tip in tips.items():
-        branch(name)
-        if not isinstance(tip, str) or not OID.fullmatch(tip):
-            raise Failure('Invalid origin tracking commit.')
     return metadata
 
 
@@ -478,10 +469,7 @@ def main(argv=None):
             print("Local inspection completed. No remote contacted; nothing published.")
             return 0
         url = "git@github.com:" + args.repo + ".git"
-        expected = UNSPECIFIED
-        if metadata and args.repo == github_origin(metadata['origin']):
-            expected = metadata['origin_tips'].get(args.branch)
-        old = check_update(git, url, ref, oid, expected)
+        old = check_update(git, url, ref, oid)
         if old == oid:
             print("Remote branch already points to this commit; nothing published.")
             return 0

@@ -74,14 +74,6 @@ def main():
         raise RuntimeError('Invalid source branch')
     source = 'refs/heads/' + selected
     oid = run('rev-parse', '--verify', source + '^{commit}').decode('ascii').strip()
-    # Snapshot last-fetched origin branches. Publishing must not silently adopt
-    # a newer remote tip, even when it happens to be an ancestor of our proposal.
-    origin_tips = {}
-    for line in run('for-each-ref', '--format=%(refname) %(objectname) %(symref)',
-                    'refs/remotes/origin/').decode('ascii').splitlines():
-        name, tip, symbolic = line.split(' ', 2)
-        if not symbolic:
-            origin_tips[name.removeprefix('refs/remotes/origin/')] = tip
     # Read-only: never stage or commit user files. Dirty state is informational.
     dirty = bool(run('status', '--porcelain', '--untracked-files=normal', '--ignore-submodules=all'))
     run('bundle', 'create', str(output / 'checkout.bundle'), source)
@@ -90,7 +82,6 @@ def main():
         raise RuntimeError('Branch changed while exporting; retry')
     (output / 'metadata.json').write_text(json.dumps({
         'origin': urls[0], 'branch': selected, 'oid': oid, 'dirty': dirty,
-        'origin_tips': origin_tips,
     }))
 
 

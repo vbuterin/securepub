@@ -160,20 +160,24 @@ No pager, external diff, textconv, checkout or project code runs on the host.
 Control/non-ASCII characters are escaped for terminal safety. Diff output above
 2 MiB aborts rather than showing an incomplete diff and allowing approval.
 
-In directory mode when publishing to origin, the live destination must match
-its last-fetched `refs/remotes/origin/<destination-branch>` in the checkout.
-Missing tracking ref means a new branch is expected. If the remote has changed,
-publication fails **before fetching/review**; the agent must fetch and merge in
-the development sandbox, then retry. Securepub never updates the checkout's
-tracking refs itself, including after a successful push. Fetch there before the
-next publication. Tracking metadata is bounded to 8 KiB; very large ref sets
-currently fail closed.
+All modes compare the proposal with the **live remote branch**, not the
+checkout's potentially stale origin tracking refs:
 
-Bundle mode and explicit `--repo` overrides to another repository have no local
-tracking baseline; they check fast-forward ancestry against the live remote.
-All modes recheck the remote after approval and enforce a compare-and-swap lease
-at push time. No automatic pull, merge, rebase, retry or history rewrite. Every
-update needs new approval. A destination repository must already exist.
+- Remote tip is already in the proposed history: count/review/publish only the
+  remaining local commits, even if the remote advanced since the last fetch.
+- Identical tips: report nothing to publish, without an approval prompt.
+- Remote has commits absent from the proposal (diverged or local is behind):
+  refuse before approval. The agent must fetch and merge in the development
+  sandbox, then retry.
+- Destination branch does not exist: offer to create it.
+
+Securepub fetches into private staging to check ancestry; the development
+checkout remains read-only. No refresh of its tracking refs is required merely
+to publish again. All modes recheck the remote after approval and enforce a
+compare-and-swap lease at push time. A remote change during review aborts rather
+than silently changing what was reviewed. No automatic pull, merge, rebase, retry
+or history rewrite. Every update needs new approval. A destination repository
+must already exist.
 
 SSH is pinned to `git@github.com`, host-key checking is mandatory, batch mode is
 on, and `~/.ssh/config` is **not used** (avoids ProxyCommand and other executable

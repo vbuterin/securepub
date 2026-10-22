@@ -83,7 +83,7 @@ class Publication(unittest.TestCase):
         with self.assertRaises(pub.Failure):
             pub.push(git, str(self.remote), self.ref, oid, old)
 
-    def test_export_helper_records_origin_tracking_refs(self):
+    def test_export_helper_does_not_require_tracking_refs(self):
         # Trusted disposable checkout only: exercise helper parsing directly,
         # not sandbox containment or an agent-controlled production checkout.
         oid = run(self.src, 'rev-parse', 'HEAD')
@@ -96,30 +96,49 @@ class Publication(unittest.TestCase):
                         GIT, '', str(self.src), str(output)], check=True, capture_output=True,
                        env=pub.clean_environment(self.root), preexec_fn=pub.limits, timeout=30)
         metadata = json.loads((output / 'metadata.json').read_text())
-        self.assertEqual(metadata['origin_tips'], {'main': oid})
+        self.assertNotIn('origin_tips', metadata)
         self.assertEqual(metadata['oid'], oid)
 
-    def test_remote_advance_rejected_before_fetch_even_if_ancestor(self):
+    def test_remote_ancestor_leaves_only_remaining_commits(self):
         previous = run(self.src, 'rev-parse', 'HEAD')
+        run(self.src, 'update-ref', 'refs/remotes/origin/main', previous)
         advanced = self.commit('remote advance already in our history')
         run(self.src, 'push', str(self.remote), 'main')
         self.commit('our additional work')
         git, oid, _ = self.stage()
+        old = pub.check_update(git, str(self.remote), self.ref, oid)
+        self.assertEqual(old, advanced)
+        count, base, _, files = pub.proposal_summary(git, oid, old)
+        self.assertEqual((count, base, files), ('1', advanced, [b'file']))
+        pub.push(git, str(self.remote), self.ref, oid, old)
+        self.assertEqual(run(self.remote, 'rev-parse', self.ref), oid)
+        # No checkout fetch is required before the next publication.
+        self.assertEqual(run(self.src, 'rev-parse', 'refs/remotes/origin/main'), previous)
+        self.commit('next local work')
+        git2, next_oid, _ = self.stage('next')
+        self.assertEqual(pub.check_update(git2, str(self.remote), self.ref, next_oid), oid)
+        self.assertEqual(pub.proposal_summary(git2, next_oid, oid)[0], '1')
+
+    def test_identical_remote_is_noop_without_fetch(self):
+        run(self.src, 'push', str(self.remote), 'main')
+        git, oid, _ = self.stage()
         with mock.patch.object(git, 'run', wraps=git.run) as calls:
-            with self.assertRaisesRegex(pub.Failure, 'Fetch and merge'):
-                pub.check_update(git, str(self.remote), self.ref, oid, expected=previous)
+            self.assertEqual(pub.check_update(git, str(self.remote), self.ref, oid), oid)
         self.assertEqual([c.args[0] for c in calls.call_args_list], ['ls-remote'])
-        # After an explicit fetch/merge by the agent, the refreshed tip works.
-        self.assertEqual(pub.check_update(git, str(self.remote), self.ref, oid, expected=advanced), advanced)
-        with self.assertRaisesRegex(pub.Failure, 'Remote branch changed'):
-            pub.check_update(git, str(self.remote), self.ref, oid, expected=None)
+
+    def test_remote_ahead_of_local_is_rejected(self):
+        git, oid, _ = self.stage()
+        self.commit('remote-only commit')
+        run(self.src, 'push', str(self.remote), 'main')
+        with self.assertRaisesRegex(pub.Failure, 'Non-fast-forward'):
+            pub.check_update(git, str(self.remote), self.ref, oid)
 
     def test_existing_branch_advance_during_review_rejected(self):
         previous = run(self.src, 'rev-parse', 'HEAD')
         run(self.src, 'push', str(self.remote), 'main')
         self.commit('proposal')
         git, oid, _ = self.stage()
-        old = pub.check_update(git, str(self.remote), self.ref, oid, expected=previous)
+        old = pub.check_update(git, str(self.remote), self.ref, oid)
         self.commit('concurrent update')
         run(self.src, 'push', str(self.remote), 'main')
         with self.assertRaisesRegex(pub.Failure, 'Remote changed during review'):
@@ -128,7 +147,7 @@ class Publication(unittest.TestCase):
     def test_lease_catches_update_after_final_remote_check(self):
         self.commit('proposal')
         git, oid, _ = self.stage()
-        old = pub.check_update(git, str(self.remote), self.ref, oid, expected=None)
+        old = pub.check_update(git, str(self.remote), self.ref, oid)
         self.commit('concurrent update')
         run(self.src, 'push', str(self.remote), 'main')
         # Simulate a remote change between the final ls-remote and actual push.
@@ -285,7 +304,7 @@ class Publication(unittest.TestCase):
             self.assertEqual(directory, self.src)
             self.assertIsNone(source)
             shutil.copyfile(bundle, output / 'checkout.bundle')
-            return dict(origin='https://github.com/owner/repo.git', branch='main', oid=oid, dirty=True, origin_tips={})
+            return dict(origin='https://github.com/owner/repo.git', branch='main', oid=oid, dirty=True)
 
         with mock.patch.dict(os.environ, HOME=str(home)), mock.patch.object(pub, 'export_checkout', export), \
                 mock.patch('builtins.print') as printer:
@@ -297,7 +316,7 @@ class Publication(unittest.TestCase):
     def test_export_rejects_oversized_metadata(self):
         output = self.root / 'oversized-output'
         output.mkdir()
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
         encoded = json.dumps(metadata).encode('ascii')
         child = mock.Mock(returncode=0)
         with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
@@ -314,7 +333,7 @@ class Publication(unittest.TestCase):
     def test_export_command_contains_only_expected_grants(self):
         output = self.root / 'output'
         output.mkdir()
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
         (output / 'metadata.json').write_text(json.dumps(metadata))
         child = mock.Mock(returncode=0)
         with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
@@ -377,7 +396,7 @@ class Publication(unittest.TestCase):
         self.assertEqual(oid, metadata['oid'])
 
     def test_backend_selection_and_confirmed_fallback(self):
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
         for mode in ('primary', 'fallback', 'deny'):
             output = self.root / mode
             output.mkdir()
@@ -449,7 +468,7 @@ class Publication(unittest.TestCase):
     def test_monkeybox_command_uses_dedicated_launcher(self):
         output = self.root / 'vm-output'
         output.mkdir()
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
         (output / 'metadata.json').write_text(json.dumps(metadata))
         child = mock.Mock(returncode=0)
         with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
