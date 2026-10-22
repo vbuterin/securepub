@@ -83,6 +83,59 @@ class Publication(unittest.TestCase):
         with self.assertRaises(pub.Failure):
             pub.push(git, str(self.remote), self.ref, oid, old)
 
+    def test_export_helper_records_origin_tracking_refs(self):
+        # Trusted disposable checkout only: exercise helper parsing directly,
+        # not sandbox containment or an agent-controlled production checkout.
+        oid = run(self.src, 'rev-parse', 'HEAD')
+        run(self.src, 'remote', 'add', 'origin', 'git@github.com:owner/repo.git')
+        run(self.src, 'update-ref', 'refs/remotes/origin/main', oid)
+        run(self.src, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main')
+        output = self.root / 'helper-output'
+        output.mkdir()
+        subprocess.run([os.sys.executable, '-I', str(Path(pub.__file__).with_name('export_checkout.py')),
+                        GIT, '', str(self.src), str(output)], check=True, capture_output=True,
+                       env=pub.clean_environment(self.root), preexec_fn=pub.limits, timeout=30)
+        metadata = json.loads((output / 'metadata.json').read_text())
+        self.assertEqual(metadata['origin_tips'], {'main': oid})
+        self.assertEqual(metadata['oid'], oid)
+
+    def test_remote_advance_rejected_before_fetch_even_if_ancestor(self):
+        previous = run(self.src, 'rev-parse', 'HEAD')
+        advanced = self.commit('remote advance already in our history')
+        run(self.src, 'push', str(self.remote), 'main')
+        self.commit('our additional work')
+        git, oid, _ = self.stage()
+        with mock.patch.object(git, 'run', wraps=git.run) as calls:
+            with self.assertRaisesRegex(pub.Failure, 'Fetch and merge'):
+                pub.check_update(git, str(self.remote), self.ref, oid, expected=previous)
+        self.assertEqual([c.args[0] for c in calls.call_args_list], ['ls-remote'])
+        # After an explicit fetch/merge by the agent, the refreshed tip works.
+        self.assertEqual(pub.check_update(git, str(self.remote), self.ref, oid, expected=advanced), advanced)
+        with self.assertRaisesRegex(pub.Failure, 'Remote branch changed'):
+            pub.check_update(git, str(self.remote), self.ref, oid, expected=None)
+
+    def test_existing_branch_advance_during_review_rejected(self):
+        previous = run(self.src, 'rev-parse', 'HEAD')
+        run(self.src, 'push', str(self.remote), 'main')
+        self.commit('proposal')
+        git, oid, _ = self.stage()
+        old = pub.check_update(git, str(self.remote), self.ref, oid, expected=previous)
+        self.commit('concurrent update')
+        run(self.src, 'push', str(self.remote), 'main')
+        with self.assertRaisesRegex(pub.Failure, 'Remote changed during review'):
+            pub.push(git, str(self.remote), self.ref, oid, old)
+
+    def test_lease_catches_update_after_final_remote_check(self):
+        self.commit('proposal')
+        git, oid, _ = self.stage()
+        old = pub.check_update(git, str(self.remote), self.ref, oid, expected=None)
+        self.commit('concurrent update')
+        run(self.src, 'push', str(self.remote), 'main')
+        # Simulate a remote change between the final ls-remote and actual push.
+        with mock.patch.object(pub, 'remote_tip', return_value=None):
+            with self.assertRaises(pub.Failure):
+                pub.push(git, str(self.remote), self.ref, oid, old)
+
     def test_divergence_rejected(self):
         first = run(self.src, "rev-parse", "HEAD")
         self.commit("remote work")
@@ -176,11 +229,12 @@ class Publication(unittest.TestCase):
 
     def test_real_private_terminal_approval(self):
         # Exercise the actual /dev/tty path on a private PTY, never the desktop.
+        git, oid, _ = self.stage()
         for approve in (False, True):
             pid, fd = pty.fork()
             if pid == 0:
                 try:
-                    pub.confirm("owner/repo", self.ref, "a" * 40, None)
+                    pub.confirm(git, "owner/repo", self.ref, oid, None)
                 except pub.Failure:
                     os._exit(2)
                 os._exit(0)
@@ -194,7 +248,9 @@ class Publication(unittest.TestCase):
                     ready, _, _ = select.select([fd], [], [], remaining)
                     self.assertTrue(ready)
                     output += os.read(fd, 8192)
-                answer = ("publish owner/repo " + self.ref + " " + "a" * 40) if approve else "no"
+                self.assertIn(b'Requesting to publish 1 commit of branch main to owner/repo', output)
+                self.assertNotIn(oid.encode(), output)
+                answer = 'YeS' if approve else 'no'
                 os.write(fd, (answer + "\n").encode())
                 while time.monotonic() < deadline:
                     child, status = os.waitpid(pid, os.WNOHANG)
@@ -229,7 +285,7 @@ class Publication(unittest.TestCase):
             self.assertEqual(directory, self.src)
             self.assertIsNone(source)
             shutil.copyfile(bundle, output / 'checkout.bundle')
-            return dict(origin='https://github.com/owner/repo.git', branch='main', oid=oid, dirty=True)
+            return dict(origin='https://github.com/owner/repo.git', branch='main', oid=oid, dirty=True, origin_tips={})
 
         with mock.patch.dict(os.environ, HOME=str(home)), mock.patch.object(pub, 'export_checkout', export), \
                 mock.patch('builtins.print') as printer:
@@ -241,7 +297,7 @@ class Publication(unittest.TestCase):
     def test_export_rejects_oversized_metadata(self):
         output = self.root / 'oversized-output'
         output.mkdir()
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
         encoded = json.dumps(metadata).encode('ascii')
         child = mock.Mock(returncode=0)
         with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
@@ -258,7 +314,7 @@ class Publication(unittest.TestCase):
     def test_export_command_contains_only_expected_grants(self):
         output = self.root / 'output'
         output.mkdir()
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
         (output / 'metadata.json').write_text(json.dumps(metadata))
         child = mock.Mock(returncode=0)
         with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
@@ -321,7 +377,7 @@ class Publication(unittest.TestCase):
         self.assertEqual(oid, metadata['oid'])
 
     def test_backend_selection_and_confirmed_fallback(self):
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
         for mode in ('primary', 'fallback', 'deny'):
             output = self.root / mode
             output.mkdir()
@@ -393,7 +449,7 @@ class Publication(unittest.TestCase):
     def test_monkeybox_command_uses_dedicated_launcher(self):
         output = self.root / 'vm-output'
         output.mkdir()
-        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False)
+        metadata = dict(origin='git@github.com:owner/repo.git', branch='main', oid='a' * 40, dirty=False, origin_tips={})
         (output / 'metadata.json').write_text(json.dumps(metadata))
         child = mock.Mock(returncode=0)
         with mock.patch.object(pub, 'executable', side_effect=lambda name: '/nix/store/test/bin/' + name), \
@@ -444,15 +500,61 @@ class Publication(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in runtimes))
 
     def test_approval_cannot_come_from_stdin(self):
-        with mock.patch("builtins.open", side_effect=OSError("no tty")):
-            with self.assertRaisesRegex(pub.Failure, "host terminal"):
-                pub.confirm("owner/repo", self.ref, "a" * 40, None)
+        git, oid, _ = self.stage()
+        with mock.patch('builtins.open', side_effect=OSError('no tty')):
+            with self.assertRaisesRegex(pub.Failure, 'host terminal'):
+                pub.confirm(git, 'owner/repo', self.ref, oid, None)
+
+    def test_tolerant_approval_and_view_never_approves(self):
+        git, oid, _ = self.stage()
+        for answers, approved in ((['y\n'], True), ([' YES \n'], True),
+                                  (['n\n'], False), (['NO\n'], False),
+                                  (['\n'], False), ([''], False), (['yes'], False),
+                                  (['view\n', 'N\n'], False),
+                                  (['V\n', 'view\n', 'what?\n', 'Y\n'], True)):
+            tty = mock.MagicMock()
+            tty.__enter__.return_value = tty
+            tty.readline.side_effect = answers
+            with mock.patch('builtins.open', return_value=tty):
+                if approved:
+                    pub.confirm(git, 'owner/repo', self.ref, oid, None)
+                else:
+                    with self.assertRaisesRegex(pub.Failure, 'cancelled'):
+                        pub.confirm(git, 'owner/repo', self.ref, oid, None)
+            shown = ''.join(c.args[0] for c in tty.write.call_args_list)
+            self.assertIn('Total 1 files changed:', shown)
+            self.assertIn('./file\n', shown)
+            if any(a.strip().lower() in ('v', 'view') for a in answers):
+                self.assertIn('diff --git', shown)
+                self.assertIn('+initial', shown)
+            else:
+                self.assertNotIn(oid, shown)
+
+    def test_summary_net_changes_and_safe_diff(self):
+        old = run(self.src, 'rev-parse', 'HEAD')
+        hostile = 'escape-\x1b[2J\n\u202e.txt'
+        (self.src / hostile).write_text('hello\x1b[2J\u202e\n')
+        run(self.src, 'add', '--', hostile)
+        run(self.src, 'commit', '-m', 'hostile display fixture')
+        self.commit('second')
+        git, oid, _ = self.stage()
+        count, base, _, files = pub.proposal_summary(git, oid, old)
+        self.assertEqual(count, '2')
+        self.assertEqual(base, old)
+        self.assertEqual(set(files), {b'file', hostile.encode()})
         tty = mock.MagicMock()
         tty.__enter__.return_value = tty
-        tty.readline.return_value = "yes\n"
-        with mock.patch("builtins.open", return_value=tty):
-            with self.assertRaisesRegex(pub.Failure, "cancelled"):
-                pub.confirm("owner/repo", self.ref, "a" * 40, None)
+        tty.readline.side_effect = ['view\n', 'no\n']
+        with mock.patch('builtins.open', return_value=tty):
+            with self.assertRaises(pub.Failure):
+                pub.confirm(git, 'owner/repo', self.ref, oid, old)
+        shown = ''.join(c.args[0] for c in tty.write.call_args_list)
+        self.assertNotIn('\x1b', shown)
+        self.assertNotIn('\u202e', shown)
+        self.assertIn('Total 2 files changed:', shown)
+        self.assertEqual(pub.terminal_text(b'a\nb\x1b'), r'a\nb\x1b')
+        count, _, _, files = pub.proposal_summary(git, oid, oid)
+        self.assertEqual((count, files), ('0', []))
 
 
 if __name__ == "__main__":

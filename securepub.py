@@ -189,14 +189,20 @@ def remote_tip(git, url, ref):
     return fields[0]
 
 
-def check_update(git, url, ref, oid):
+UNSPECIFIED = object()
+
+
+def check_update(git, url, ref, oid, expected=UNSPECIFIED):
     old = remote_tip(git, url, ref)
+    if expected is not UNSPECIFIED and old != expected:
+        raise Failure('Remote branch changed since the checkout last fetched it. '
+                      'Fetch and merge inside the development sandbox, then retry; nothing published.')
     if old:
         git.run("fetch", "--no-tags", "--no-recurse-submodules", "--no-auto-maintenance",
                 "--no-write-fetch-head", url, ref + ":refs/heads/remote-base", network=True)
         fetched = git.run("rev-parse", "refs/heads/remote-base").decode().strip()
         if fetched != old:
-            raise Failure("Remote moved during inspection. Retry publication.")
+            raise Failure('Remote moved during inspection. Fetch and merge inside the development sandbox, then retry.')
         try:
             git.run("merge-base", "--is-ancestor", old, oid)
         except Failure as error:
@@ -207,26 +213,65 @@ def check_update(git, url, ref, oid):
 def push(git, url, ref, oid, old):
     # Lease pins the *exact* previously reviewed remote state, including absence.
     # Explicit ancestry checking above means the lease never authorizes a rewrite.
+    if remote_tip(git, url, ref) != old:
+        raise Failure('Remote changed during review. Fetch and merge inside the development sandbox, then retry.')
     git.run("push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no",
             "--force-with-lease=" + ref + ":" + (old or ""),
             url, oid + ":" + ref, network=True)
 
 
-def confirm(repo, ref, oid, old):
-    phrase = "publish " + repo + " " + ref + " " + oid
-    # No --yes, stdin approval, or approval supplied by the development guest.
+def terminal_text(data, *, multiline=False):
+    """Escape control/bidi/non-ASCII bytes; never interpret repository terminal codes."""
+    text = data.decode('utf-8', 'surrogateescape')
+    return ''.join(c if ' ' <= c <= '~' or (multiline and c in '\n\t')
+                   else c.encode('unicode_escape').decode('ascii') for c in text)
+
+
+def proposal_summary(git, oid, old):
+    count = git.run('rev-list', '--count', (old + '..' if old else '') + oid).decode().strip()
+    if not count.isdecimal():
+        raise Failure('Invalid commit count.')
+    # A new branch has no prior destination tree: show all proposed files.
+    base = old or git.run('hash-object', '-w', '-t', 'tree', '/dev/null').decode().strip()
+    if not OID.fullmatch(base):
+        raise Failure('Invalid diff base.')
+    options = ('diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--color=never')
+    names = git.run(*options, '--name-only', '-z', base, oid, '--')
+    if names and not names.endswith(b'\0'):
+        raise Failure('Invalid changed-file listing.')
+    files = names[:-1].split(b'\0') if names else []
+    return count, base, options, files
+
+
+def confirm(git, repo, ref, oid, old):
+    count, base, options, files = proposal_summary(git, oid, old)
+    # Approval is still bound to the frozen OID and lease, not a mutable branch.
     try:
-        with open("/dev/tty", "r", encoding="utf-8") as reader, open(
-                "/dev/tty", "w", encoding="utf-8", buffering=1) as tty:
-            tty.write("\nDestination: git@github.com:" + repo + ".git\n"
-                      "Branch: " + ref + "\nCommit: " + oid + "\n"
-                      "Previous: " + (old or "<new branch>") + "\n\n"
-                      "Pushing may trigger CI/workflows or publish secrets in history.\n"
-                      "Type exactly to approve (anything else cancels):\n" + phrase + "\n> ")
-            if reader.readline(1024).rstrip("\n") != phrase:
-                raise Failure("Publication cancelled.")
+        with open('/dev/tty', 'r', encoding='utf-8') as reader, open(
+                '/dev/tty', 'w', encoding='utf-8', buffering=1) as tty:
+            tty.write('\nRequesting to publish ' + count + (' commit' if count == '1' else ' commits') +
+                      ' of branch ' + ref.removeprefix('refs/heads/') + ' to ' + repo + '\n\n' +
+                      'Total ' + str(len(files)) + ' files changed:\n\n')
+            for name in files:
+                tty.write('./' + terminal_text(name) + '\n')
+            while True:
+                tty.write('\nPlease type Y to accept, V to view a full diff, and N to refuse\n> ')
+                answer = reader.readline(1024)
+                # EOF, blank input and incomplete/overlong lines never approve.
+                if not answer or not answer.endswith('\n') or not answer.strip():
+                    raise Failure('Publication cancelled.')
+                answer = answer.strip().casefold()
+                if answer in ('y', 'yes'):
+                    return
+                if answer in ('n', 'no'):
+                    raise Failure('Publication cancelled.')
+                if answer in ('v', 'view'):
+                    patch = git.run(*options, '--binary', '--full-index', base, oid, '--')
+                    tty.write('\n' + (terminal_text(patch, multiline=True) if patch else '(No net changes.)\n'))
+                else:
+                    tty.write('Please enter yes, view, or no.\n')
     except OSError as error:
-        raise Failure("An interactive host terminal is required for approval.") from error
+        raise Failure('An interactive host terminal is required for approval.') from error
 
 
 def executable(name):
@@ -363,7 +408,7 @@ def _export_backend(directory, output, source=None, *, backend, runtime=None):
             raise Failure('Export metadata exceeded the size limit.')
         # Validate the whole bounded document, never a truncated JSON prefix.
         metadata = json.loads(encoded)
-    if not isinstance(metadata, dict) or set(metadata) != {'origin', 'branch', 'oid', 'dirty'}:
+    if not isinstance(metadata, dict) or set(metadata) != {'origin', 'branch', 'oid', 'dirty', 'origin_tips'}:
         raise Failure('Invalid export metadata')
     if not all(isinstance(metadata[k], str) for k in ('origin', 'branch', 'oid')):
         raise Failure('Invalid export metadata types')
@@ -371,6 +416,13 @@ def _export_backend(directory, output, source=None, *, backend, runtime=None):
     branch(metadata['branch'])
     if not OID.fullmatch(metadata['oid']) or type(metadata['dirty']) is not bool:
         raise Failure('Invalid export commit or dirty status')
+    tips = metadata['origin_tips']
+    if not isinstance(tips, dict):
+        raise Failure('Invalid origin tracking refs.')
+    for name, tip in tips.items():
+        branch(name)
+        if not isinstance(tip, str) or not OID.fullmatch(tip):
+            raise Failure('Invalid origin tracking commit.')
     return metadata
 
 
@@ -417,32 +469,29 @@ def main(argv=None):
             oid, digest = prepare(git, bundle, args.source or 'main', args.max_bundle_mib * 1024**2)
         if metadata and oid != metadata['oid']:
             raise Failure('Exported branch moved during preparation; retry.')
-        print('Destination: ' + args.repo + ' ' + ref)
         if metadata and metadata['dirty']:
             print('WARNING: uncommitted/untracked changes are NOT included. Publishing commits only.')
-        print("Staged bundle SHA256: " + digest)
-        print("Proposed commit: " + oid)
-        # No checkout, external diff, textconv, filenames or commit messages rendered.
-        print("Inspect this exact proposal in a sandbox before approving publication.")
         if args.inspect:
+            print('Destination: ' + args.repo + ' ' + ref)
+            print('Staged bundle SHA256: ' + digest)
+            print('Proposed commit: ' + oid)
             print("Local inspection completed. No remote contacted; nothing published.")
             return 0
         url = "git@github.com:" + args.repo + ".git"
-        old = check_update(git, url, ref, oid)
+        expected = UNSPECIFIED
+        if metadata and args.repo == github_origin(metadata['origin']):
+            expected = metadata['origin_tips'].get(args.branch)
+        old = check_update(git, url, ref, oid, expected)
         if old == oid:
             print("Remote branch already points to this commit; nothing published.")
             return 0
-        count = git.run("rev-list", "--count", (old + ".." if old else "") + oid).decode().strip()
-        if not count.isdecimal():
-            raise Failure("Invalid commit count.")
-        print("Commits introduced: " + count)
-        confirm(args.repo, ref, oid, old)
+        confirm(git, args.repo, ref, oid, old)
         try:
             push(git, url, ref, oid, old)
         except (Failure, OSError, subprocess.TimeoutExpired) as error:
             raise Failure("Push did not report success; its remote outcome may be uncertain. "
                           "Check the destination before retrying. " + str(error)) from error
-        print("Published " + oid + " to " + args.repo + " " + ref)
+        print('Published branch ' + args.branch + ' to ' + args.repo + '.')
     return 0
 
 

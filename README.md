@@ -22,7 +22,9 @@ the exact commit/repository/branch before pushing using host SSH authentication.
   Linked worktrees can use explicit bundle mode instead.
 - `--repo`, `--branch`, `--source` override defaults. `--inspect` validates
   locally without authentication or network access.
-- Approval still requires the exact confirmation phrase, not automatic consent.
+- Approval shows commit count, branch, repository and changed filenames. Enter
+  `Y`/`yes` to accept, `V`/`view` for a full diff, or `N`/`no` to refuse (case
+  insensitive). Blank input/EOF cancels; viewing never approves publication.
 
 Directory mode tries a dedicated Monkeybox launcher first (KVM required), pinned
 by the Nix package. It does not use the host's general-purpose `mbox` profile.
@@ -131,11 +133,47 @@ securepub /path/to/exchange/proposal.bundle \
   --source main --repo vbuterin/securepub --branch beta/first-test
 ```
 
-The prompt requires typing `publish OWNER/REPO refs/heads/BRANCH FULL_COMMIT_ID`.
-There is no approval via stdin. Check that this ID matches your reviewed result.
-A destination repository must already exist. Updating an existing branch requires
-its tip to be an ancestor of the proposal; otherwise merge inside the sandbox
-and export again. Every update needs new approval.
+The host terminal shows, for example:
+
+```text
+Requesting to publish 3 commits of branch main to vbuterin/monkeybox
+
+Total 4 files changed:
+
+./example.py
+./tests/example_test.py
+./other_stuff.py
+./README.md
+
+Please type Y to accept, V to view a full diff, and N to refuse
+```
+
+Whitespace and case are ignored for `y`/`yes`, `v`/`view`, `n`/`no`. Unknown
+answers reprompt; blank input/EOF cancels. No stdin approval. Hashes remain
+internal during normal publication (available with `--inspect`). Approval is
+bound to the same frozen commit and remote lease even without typing its hash.
+
+Files and diff are the **net tree change**, not each commit's individual patch.
+A new branch is compared with an empty tree. Renames appear as deletion/addition;
+binary changes use Git binary patches. Viewing returns to the approval prompt.
+No pager, external diff, textconv, checkout or project code runs on the host.
+Control/non-ASCII characters are escaped for terminal safety. Diff output above
+2 MiB aborts rather than showing an incomplete diff and allowing approval.
+
+In directory mode when publishing to origin, the live destination must match
+its last-fetched `refs/remotes/origin/<destination-branch>` in the checkout.
+Missing tracking ref means a new branch is expected. If the remote has changed,
+publication fails **before fetching/review**; the agent must fetch and merge in
+the development sandbox, then retry. Securepub never updates the checkout's
+tracking refs itself, including after a successful push. Fetch there before the
+next publication. Tracking metadata is bounded to 8 KiB; very large ref sets
+currently fail closed.
+
+Bundle mode and explicit `--repo` overrides to another repository have no local
+tracking baseline; they check fast-forward ancestry against the live remote.
+All modes recheck the remote after approval and enforce a compare-and-swap lease
+at push time. No automatic pull, merge, rebase, retry or history rewrite. Every
+update needs new approval. A destination repository must already exist.
 
 SSH is pinned to `git@github.com`, host-key checking is mandatory, batch mode is
 on, and `~/.ssh/config` is **not used** (avoids ProxyCommand and other executable
